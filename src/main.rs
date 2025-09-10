@@ -504,10 +504,10 @@ fn main() -> Result<()> {
     let epochs = 2000;
     
     // Create cosine annealing learning rate scheduler - match Python T_max=3000
-    let scheduler = CosineAnnealingLrSchedulerConfig::new(lr, 3000) // Match Python T_max exactly
+    /*let scheduler = CosineAnnealingLrSchedulerConfig::new(lr, 3000) // Match Python T_max exactly
         .with_min_lr(lr * 0.1)
         .init()
-        .expect("Failed to initialize cosine annealing scheduler");
+        .expect("Failed to initialize cosine annealing scheduler");*/
     
     let learner = learner_builder
         .devices(vec![device.clone()])
@@ -524,7 +524,7 @@ fn main() -> Result<()> {
                 .with_weight_decay(0.1)
                 .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
                 .init(),
-            scheduler,
+            lr,
         );
 
     let model_trained = learner.fit(dataloader_train, dataloader_valid);
