@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use tokenizers::Tokenizer;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 type WgpuBackend = burn::backend::wgpu::Wgpu;
 type WgpuAutodiffBackend = burn::backend::Autodiff<WgpuBackend>;
@@ -84,14 +85,54 @@ pub struct TextBatch<B: Backend> {
     pub targets: Tensor<B, 2, Int>,  // [batch_size, context_length]
 }
 
-#[derive(Clone)]
 pub struct TextBatcher {
     context_length: usize,
+    current_position: AtomicUsize,
+}
+
+impl Clone for TextBatcher {
+    fn clone(&self) -> Self {
+        Self {
+            context_length: self.context_length,
+            current_position: AtomicUsize::new(self.current_position.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl TextBatcher {
     pub fn new(context_length: usize) -> Self {
-        Self { context_length }
+        Self { 
+            context_length,
+            current_position: AtomicUsize::new(0),
+        }
+    }
+    
+    // Python-style get_batch with wrap-around
+    pub fn get_batch_python_style(&self, tokens: &[i32], batch_size: usize) -> (Vec<i32>, Vec<i32>) {
+        let c = self.context_length;
+        let start_pos = self.current_position.load(Ordering::Relaxed);
+        let end_pos = start_pos + batch_size * c + 1;
+        
+        let mut data = Vec::new();
+        
+        // Handle wrap-around like Python implementation
+        if end_pos > tokens.len() {
+            let add_data = end_pos - tokens.len();
+            data.extend_from_slice(&tokens[start_pos..]);
+            data.extend_from_slice(&tokens[..add_data]);
+        } else {
+            data.extend_from_slice(&tokens[start_pos..end_pos]);
+        }
+        
+        let inputs = data[..data.len()-1].to_vec();
+        let targets = data[1..].to_vec();
+        
+        // Update position
+        let next_pos = start_pos + batch_size * c;
+        let next_pos = if next_pos >= tokens.len() { 0 } else { next_pos };
+        self.current_position.store(next_pos, Ordering::Relaxed);
+        
+        (inputs, targets)
     }
 }
 
@@ -340,14 +381,23 @@ impl<B: Backend> Gpt2Model<B> {
                 .slice([0..dims[0], (dims[1] - 1)..dims[1], 0..dims[2]])
                 .squeeze::<2>(1);
             let probs = burn::tensor::activation::softmax(last_logits, 1);
-            // Multinomial sampling (per-batch, single token)
+            // Multinomial sampling matching Python's torch.multinomial
             let probs_vec = probs.clone().into_data().to_vec::<f32>().unwrap();
-            let dist = WeightedIndex::new(&probs_vec).unwrap();
-            let idx = dist.sample(&mut rng) as i32; // single-batch assumption in demo
+            let batch_size = probs.dims()[0];
+            
+            // Sample for each batch (though we assume single batch here)
+            let mut next_tokens = Vec::new();
+            for b in 0..batch_size {
+                let batch_probs = &probs_vec[b * self.vocab_size..(b + 1) * self.vocab_size];
+                let dist = WeightedIndex::new(batch_probs).unwrap();
+                let idx = dist.sample(&mut rng) as i32;
+                next_tokens.push(idx);
+            }
+            
             let next_token: Tensor<B, 2, Int> = Tensor::<B, 1, Int>::from_data(
-                TensorData::from(&[idx][..]),
+                TensorData::from(&next_tokens[..]),
                 &probs.device(),
-            ).reshape([1, 1]);
+            ).reshape([batch_size, 1]);
 
             output = Tensor::cat(vec![output, next_token.clone()], 1);
             current_inputs = Tensor::cat(vec![current_inputs, next_token], 1);
@@ -393,11 +443,13 @@ impl<B: Backend> ValidStep<TextBatch<B>, ClassificationOutput<B>> for Gpt2Model<
 
 fn main() -> Result<()> {
     // Load GPT-2 BPE tokenizer from tokenizer.json (HuggingFace tokenizers)
+    // This should be compatible with tiktoken GPT-2 encoding
     let tokenizer = Tokenizer::from_file("tokenizer.json")
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
+    let vocab_size = tokenizer.get_vocab_size(true);
     println!("Tokenizer loaded:");
-    println!("  Vocabulary size: {}", tokenizer.get_vocab_size(true));
+    println!("  Vocabulary size: {} (matches tiktoken gpt2)", vocab_size);
     
     let context_length: usize = 512; // increased context length for BPE tokens
     
@@ -414,14 +466,18 @@ fn main() -> Result<()> {
     
     let device = burn::backend::wgpu::WgpuDevice::default();
 
+    // Match Python batch sizes exactly
+    let train_batch_size = 16;
+    let eval_batch_size = 8;
+    
     let dataloader_train = DataLoaderBuilder::new(train_batcher)
-        .batch_size(16)
+        .batch_size(train_batch_size)
         .shuffle(42)
         .num_workers(1)
         .build(train_dataset);
 
     let dataloader_valid = DataLoaderBuilder::new(val_batcher)
-        .batch_size(8)
+        .batch_size(eval_batch_size)
         .num_workers(1)
         .build(val_dataset);
 
@@ -433,12 +489,13 @@ fn main() -> Result<()> {
         LearnerBuilder::new(output_dir.clone()).with_file_checkpointer(CompactRecorder::default());
 
 
+    // Match Python hyperparameters exactly
     let config = Gpt2Config {
-        vocab_size: tokenizer.get_vocab_size(true),
-        d_model: 768,
-        n_heads: 4,
-        n_layers: 8,
-        context_length,
+        vocab_size,  // Use the tokenizer vocab_size (should match tiktoken)
+        d_model: 768,    // matches Python d_model
+        n_heads: 4,      // matches Python n_heads  
+        n_layers: 8,     // matches Python n_layers
+        context_length,  // matches Python context_length (512)
     };
 
     // Match Python training parameters
