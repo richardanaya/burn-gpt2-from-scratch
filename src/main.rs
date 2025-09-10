@@ -15,6 +15,8 @@ use burn::config::Config;
 use burn::module::Module;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
+use rand::distributions::WeightedIndex;
+use rand::prelude::*;
 
 type WgpuBackend = burn::backend::wgpu::Wgpu;
 type WgpuAutodiffBackend = burn::backend::Autodiff<WgpuBackend>;
@@ -156,6 +158,8 @@ impl<B: Backend> PositionalEncoding<B> {
 pub struct Gpt2Config {
     vocab_size: usize,
     d_model: usize,
+    n_heads: usize,
+    n_layers: usize,
     context_length: usize,
 }
 
@@ -172,32 +176,38 @@ pub struct SelfAttention<B: Backend> {
     v_proj: Linear<B>,
     o_proj: Linear<B>,
     dropout: Dropout,
+    n_heads: usize,
 }
 
 impl<B: Backend> SelfAttention<B> {
-    pub fn new(d_model: usize, device: &B::Device) -> Self {
+    pub fn new(d_model: usize, n_heads: usize, device: &B::Device) -> Self {
+        assert!(d_model % n_heads == 0, "d_model must be divisible by n_heads");
         Self {
             q_proj: LinearConfig::new(d_model, d_model).init(device),
             k_proj: LinearConfig::new(d_model, d_model).init(device),
             v_proj: LinearConfig::new(d_model, d_model).init(device),
             o_proj: LinearConfig::new(d_model, d_model).init(device),
             dropout: DropoutConfig::new(0.2).init(),
+            n_heads,
         }
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let [b, l, d] = x.dims();
+        let head_dim = d / self.n_heads;
         let xf = x.clone().reshape([b * l, d]);
-        let q = self.q_proj.forward(xf.clone()).reshape([b, l, d]);
-        let k = self.k_proj.forward(xf.clone()).reshape([b, l, d]);
-        let v = self.v_proj.forward(xf).reshape([b, l, d]);
-        // Attention scores: [B, L, L]
-        let k_t = k.swap_dims(1, 2);
-        let mut scores = q.matmul(k_t);
-        // Scale by sqrt(d_model)
-        let scale = (d as f32).sqrt();
+        let q = self.q_proj.forward(xf.clone()).reshape([b, l, self.n_heads, head_dim]).swap_dims(1, 2); // [B, H, L, Dh]
+        let k = self.k_proj.forward(xf.clone()).reshape([b, l, self.n_heads, head_dim]).swap_dims(1, 2); // [B, H, L, Dh]
+        let v = self.v_proj.forward(xf).reshape([b, l, self.n_heads, head_dim]).swap_dims(1, 2); // [B, H, L, Dh]
+
+        // Attention scores per head: [B, H, L, L]
+        let k_t = k.swap_dims(2, 3); // [B, H, Dh, L]
+        let mut scores = q.matmul(k_t); // [B, H, L, L]
+        // Scale by sqrt(head_dim)
+        let scale = (head_dim as f32).sqrt();
         scores = scores / scale;
-        // Build causal mask (upper triangle) and add -1e9
+
+        // Build causal mask (upper triangle) [L, L] and broadcast to [1,1,L,L]
         let mut mask = vec![0f32; l * l];
         for i in 0..l {
             for j in (i + 1)..l {
@@ -205,21 +215,63 @@ impl<B: Backend> SelfAttention<B> {
             }
         }
         let device = &scores.device();
-        // Create 1D tensor first, then reshape to [L, L] and unsqueeze to [1, L, L]
         let mask_tensor = Tensor::<B, 1>::from_data(TensorData::from(&mask[..]), device)
             .reshape([l, l])
-            .unsqueeze::<3>(); // [1, L, L]
-        let neg_inf = -1e9f32;
-        let mask_bias = mask_tensor * neg_inf; // [1, L, L]
-        let scores = scores + mask_bias; // broadcast over batch dim
+            .unsqueeze::<3>() // [1, L, L]
+            .unsqueeze::<4>(); // [1, 1, L, L]
+        let scores = scores + mask_tensor * (-1e9f32);
+
         // Softmax over last dimension
-        let attn = burn::tensor::activation::softmax(scores, 2);
+        let attn = burn::tensor::activation::softmax(scores, 3);
         let attn = self.dropout.forward(attn);
-        // Weighted sum: [B, L, D]
-        let context = attn.matmul(v);
-        // Output projection over last dim
+
+        // Weighted sum: [B, H, L, Dh]
+        let context = attn.matmul(v); // [B, H, L, Dh]
+        // Merge heads: [B, L, D]
+        let context = context.swap_dims(1, 2).reshape([b, l, d]);
+
+        // Output projection
         let out = self.o_proj.forward(context.clone().reshape([b * l, d])).reshape([b, l, d]);
         out
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct Gpt2Block<B: Backend> {
+    att: SelfAttention<B>,
+    ln1: LayerNorm<B>,
+    ln2: LayerNorm<B>,
+    dropout: Dropout,
+    fcn1: Linear<B>,
+    fcn2: Linear<B>,
+}
+
+impl<B: Backend> Gpt2Block<B> {
+    pub fn new(d_model: usize, n_heads: usize, device: &B::Device) -> Self {
+        Self {
+            att: SelfAttention::new(d_model, n_heads, device),
+            ln1: LayerNormConfig::new(d_model).init(device),
+            ln2: LayerNormConfig::new(d_model).init(device),
+            dropout: DropoutConfig::new(0.2).init(),
+            fcn1: LinearConfig::new(d_model, 4 * d_model).init(device),
+            fcn2: LinearConfig::new(4 * d_model, d_model).init(device),
+        }
+    }
+
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        // att -> residual -> ln1
+        let att_out = self.att.forward(x.clone());
+        let adn_logits = self.ln1.forward(x + att_out);
+        // dropout then MLP
+        let x_drop = self.dropout.forward(adn_logits.clone());
+        let [b, l, d] = x_drop.dims();
+        let x2 = x_drop.clone().reshape([b * l, d]);
+        let x2 = self.fcn1.forward(x2);
+        let x2 = burn::tensor::activation::gelu(x2);
+        let x2 = self.fcn2.forward(x2);
+        let x2 = x2.reshape([b, l, d]);
+        // second residual uses adn_logits like Python snippet
+        self.ln2.forward(x2 + adn_logits)
     }
 }
 
@@ -227,12 +279,7 @@ impl<B: Backend> SelfAttention<B> {
 pub struct Gpt2Model<B: Backend> {
     wte: Embedding<B>,
     pos_enc: PositionalEncoding<B>,
-    att: SelfAttention<B>,
-    ln1: LayerNorm<B>,
-    ln2: LayerNorm<B>,
-    dropout: Dropout,
-    fcn1: Linear<B>,
-    fcn2: Linear<B>,
+    blocks: Vec<Gpt2Block<B>>, // n_layers blocks
     lm_head: Linear<B>,
     vocab_size: usize,
     context_length: usize,
@@ -240,15 +287,14 @@ pub struct Gpt2Model<B: Backend> {
 
 impl<B: Backend> Gpt2Model<B> {
     pub fn new(config: Gpt2Config, device: &B::Device) -> Self {
+        let mut blocks = Vec::with_capacity(config.n_layers);
+        for _ in 0..config.n_layers {
+            blocks.push(Gpt2Block::new(config.d_model, config.n_heads, device));
+        }
         Self {
             wte: EmbeddingConfig::new(config.vocab_size, config.d_model).init(device),
             pos_enc: PositionalEncoding::new(config.context_length, config.d_model, device),
-            att: SelfAttention::new(config.d_model, device),
-            ln1: LayerNormConfig::new(config.d_model).init(device),
-            ln2: LayerNormConfig::new(config.d_model).init(device),
-            dropout: DropoutConfig::new(0.2).init(),
-            fcn1: LinearConfig::new(config.d_model, 4 * config.d_model).init(device),
-            fcn2: LinearConfig::new(4 * config.d_model, config.d_model).init(device),
+            blocks,
             lm_head: LinearConfig::new(config.d_model, config.vocab_size).init(device),
             vocab_size: config.vocab_size,
             context_length: config.context_length,
@@ -256,29 +302,23 @@ impl<B: Backend> Gpt2Model<B> {
     }
     
     pub fn forward(&self, inputs: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        let x = self.wte.forward(inputs);
-        let x = self.pos_enc.forward(x);
-        // Self-attention + residual + norm
-        let att_out = self.att.forward(x.clone());
-        let x = self.ln1.forward(x + att_out);
-        let x = self.dropout.forward(x.clone());
-        // Feed-forward
+        let mut x = self.wte.forward(inputs);
+        x = self.pos_enc.forward(x);
+        for block in self.blocks.iter() {
+            x = block.forward(x);
+        }
         let [b, l, d] = x.dims();
-        let x2 = x.clone().reshape([b * l, d]);
-        let x2 = self.fcn1.forward(x2);
-        let x2 = burn::tensor::activation::gelu(x2);
-        let x2 = self.fcn2.forward(x2);
-        let x2 = x2.reshape([b, l, d]);
-        // Second residual + norm
-        let x = self.ln2.forward(x2 + x);
-        // Project to vocab
-        let logits = self.lm_head.forward(x.reshape([b * l, d])).reshape([b, l, self.vocab_size]);
+        let logits = self
+            .lm_head
+            .forward(x.reshape([b * l, d]))
+            .reshape([b, l, self.vocab_size]);
         logits
     }
     
     pub fn generate(&self, inputs: Tensor<B, 2, Int>, max_new_tokens: usize) -> Tensor<B, 2, Int> {
         let mut current_inputs = inputs.clone();
         let mut output = inputs;
+        let mut rng = thread_rng();
         for _ in 0..max_new_tokens {
             let dims_in = current_inputs.dims();
             let seq_len = dims_in[1];
@@ -297,7 +337,14 @@ impl<B: Backend> Gpt2Model<B> {
                 .slice([0..dims[0], (dims[1] - 1)..dims[1], 0..dims[2]])
                 .squeeze::<2>(1);
             let probs = burn::tensor::activation::softmax(last_logits, 1);
-            let next_token: Tensor<B, 2, Int> = probs.argmax(1).unsqueeze::<2>();
+            // Multinomial sampling (per-batch, single token)
+            let probs_vec = probs.clone().into_data().to_vec::<f32>().unwrap();
+            let dist = WeightedIndex::new(&probs_vec).unwrap();
+            let idx = dist.sample(&mut rng) as i32; // single-batch assumption in demo
+            let next_token: Tensor<B, 2, Int> = Tensor::<B, 1, Int>::from_data(
+                TensorData::from(&[idx][..]),
+                &probs.device(),
+            ).reshape([1, 1]);
 
             output = Tensor::cat(vec![output, next_token.clone()], 1);
             current_inputs = Tensor::cat(vec![current_inputs, next_token], 1);
@@ -353,7 +400,7 @@ fn main() -> Result<()> {
     
     // Create dataset using BPE tokenization
     let dataset = TextDataset::from_file("data.txt", &tokenizer, context_length)?;
-    let (train_dataset, val_dataset) = dataset.split(0.8);
+    let (train_dataset, val_dataset) = dataset.split(0.7);
     
     println!("Dataset split:");
     println!("  Train: {} samples", train_dataset.len());
@@ -385,7 +432,9 @@ fn main() -> Result<()> {
 
     let config = Gpt2Config {
         vocab_size: tokenizer.get_vocab_size(true),
-        d_model: 512,
+        d_model: 768,
+        n_heads: 4,
+        n_layers: 8,
         context_length,
     };
 
