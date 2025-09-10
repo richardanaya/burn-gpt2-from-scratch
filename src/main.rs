@@ -1,6 +1,7 @@
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::optim::AdamWConfig;
 use burn::lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig;
+use burn::grad_clipping::GradientClippingConfig;
 use burn::tensor::backend::AutodiffBackend;
 use burn::train::metric::{LearningRateMetric, LossMetric};
 use burn::{data::dataloader::Dataset as BurnDataset, record::CompactRecorder};
@@ -502,8 +503,8 @@ fn main() -> Result<()> {
     let lr = 1e-3;
     let epochs = 2000;
     
-    // Create cosine annealing learning rate scheduler
-    let scheduler = CosineAnnealingLrSchedulerConfig::new(lr, epochs * 100) // approximate total steps
+    // Create cosine annealing learning rate scheduler - match Python T_max=3000
+    let scheduler = CosineAnnealingLrSchedulerConfig::new(lr, 3000) // Match Python T_max exactly
         .with_min_lr(lr * 0.1)
         .init()
         .expect("Failed to initialize cosine annealing scheduler");
@@ -511,8 +512,7 @@ fn main() -> Result<()> {
     let learner = learner_builder
         .devices(vec![device.clone()])
         .num_epochs(epochs)
-        // TODO: Add gradient clipping when API is available
-        // .gradient_clipping(1.0) 
+ 
         .metric_train_numeric(LearningRateMetric::new())
         .metric_valid_numeric(LearningRateMetric::new())
         .metric_train_numeric(LossMetric::new())
@@ -522,6 +522,7 @@ fn main() -> Result<()> {
             config.init::<WgpuAutodiffBackend>(&device),
             AdamWConfig::new()
                 .with_weight_decay(0.1)
+                .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
                 .init(),
             scheduler,
         );
