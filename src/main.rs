@@ -1,5 +1,6 @@
 use burn::data::dataloader::DataLoaderBuilder;
-use burn::optim::AdamConfig;
+use burn::optim::AdamWConfig;
+use burn::lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig;
 use burn::tensor::backend::AutodiffBackend;
 use burn::train::metric::{LearningRateMetric, LossMetric};
 use burn::{data::dataloader::Dataset as BurnDataset, record::CompactRecorder};
@@ -53,8 +54,8 @@ pub type DatasetItem = (Vec<i32>, Vec<i32>);
 
 impl BurnDataset<DatasetItem> for TextDataset {
     fn get(&self, index: usize) -> Option<DatasetItem> {
-        // Non-overlapping chunks: each index represents a chunk of context_length
-        let start_idx = index * self.context_length;
+        // Overlapping sliding window: each index is a potential starting position
+        let start_idx = index;
         let end_idx = start_idx + self.context_length;
         
         if end_idx >= self.data.len() {
@@ -71,8 +72,8 @@ impl BurnDataset<DatasetItem> for TextDataset {
         if self.data.len() <= self.context_length {
             0
         } else {
-            // Non-overlapping chunks like Python article
-            self.data.len() / self.context_length
+            // Overlapping windows: every valid starting position
+            self.data.len() - self.context_length
         }
     }
 }
@@ -259,19 +260,23 @@ impl<B: Backend> Gpt2Block<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        // att -> residual -> ln1
-        let att_out = self.att.forward(x.clone());
-        let adn_logits = self.ln1.forward(x + att_out);
-        // dropout then MLP
-        let x_drop = self.dropout.forward(adn_logits.clone());
+        // Pre-norm architecture: LayerNorm before attention
+        let ln1_out = self.ln1.forward(x.clone());
+        let att_out = self.att.forward(ln1_out);
+        let after_att = x + att_out; // residual connection
+        
+        // Pre-norm architecture: LayerNorm before FFN
+        let ln2_out = self.ln2.forward(after_att.clone());
+        let x_drop = self.dropout.forward(ln2_out);
         let [b, l, d] = x_drop.dims();
-        let x2 = x_drop.clone().reshape([b * l, d]);
+        let x2 = x_drop.reshape([b * l, d]);
         let x2 = self.fcn1.forward(x2);
         let x2 = burn::tensor::activation::gelu(x2);
         let x2 = self.fcn2.forward(x2);
         let x2 = x2.reshape([b, l, d]);
-        // second residual uses adn_logits like Python snippet
-        self.ln2.forward(x2 + adn_logits)
+        
+        // Second residual connection
+        after_att + x2
     }
 }
 
@@ -280,7 +285,6 @@ pub struct Gpt2Model<B: Backend> {
     wte: Embedding<B>,
     pos_enc: PositionalEncoding<B>,
     blocks: Vec<Gpt2Block<B>>, // n_layers blocks
-    lm_head: Linear<B>,
     vocab_size: usize,
     context_length: usize,
 }
@@ -295,7 +299,6 @@ impl<B: Backend> Gpt2Model<B> {
             wte: EmbeddingConfig::new(config.vocab_size, config.d_model).init(device),
             pos_enc: PositionalEncoding::new(config.context_length, config.d_model, device),
             blocks,
-            lm_head: LinearConfig::new(config.d_model, config.vocab_size).init(device),
             vocab_size: config.vocab_size,
             context_length: config.context_length,
         }
@@ -308,11 +311,11 @@ impl<B: Backend> Gpt2Model<B> {
             x = block.forward(x);
         }
         let [b, l, d] = x.dims();
-        let logits = self
-            .lm_head
-            .forward(x.reshape([b * l, d]))
-            .reshape([b, l, self.vocab_size]);
-        logits
+        // Parameter sharing: use embedding weights for output projection
+        let wte_weight = self.wte.weight.val(); // [vocab_size, d_model]
+        let x_flat = x.reshape([b * l, d]); // [b*l, d_model]
+        let logits = x_flat.matmul(wte_weight.transpose()); // [b*l, vocab_size]
+        logits.reshape([b, l, self.vocab_size])
     }
     
     pub fn generate(&self, inputs: Tensor<B, 2, Int>, max_new_tokens: usize) -> Tensor<B, 2, Int> {
@@ -438,9 +441,21 @@ fn main() -> Result<()> {
         context_length,
     };
 
+    // Match Python training parameters
+    let lr = 1e-3;
+    let epochs = 2000;
+    
+    // Create cosine annealing learning rate scheduler
+    let scheduler = CosineAnnealingLrSchedulerConfig::new(lr, epochs * 100) // approximate total steps
+        .with_min_lr(lr * 0.1)
+        .init()
+        .expect("Failed to initialize cosine annealing scheduler");
+    
     let learner = learner_builder
         .devices(vec![device.clone()])
-        .num_epochs(10)
+        .num_epochs(epochs)
+        // TODO: Add gradient clipping when API is available
+        // .gradient_clipping(1.0) 
         .metric_train_numeric(LearningRateMetric::new())
         .metric_valid_numeric(LearningRateMetric::new())
         .metric_train_numeric(LossMetric::new())
@@ -448,8 +463,10 @@ fn main() -> Result<()> {
         .summary()
         .build(
             config.init::<WgpuAutodiffBackend>(&device),
-            AdamConfig::new().init(),
-            1e-3,
+            AdamWConfig::new()
+                .with_weight_decay(0.1)
+                .init(),
+            scheduler,
         );
 
     let model_trained = learner.fit(dataloader_train, dataloader_valid);
@@ -465,9 +482,9 @@ fn main() -> Result<()> {
         .expect("Trained model should be saved successfully");
     println!("💾 Model saved to: {}/model", output_dir.display());
     
-    // Test generation like the article
+    // Test generation like the Python article
     println!("\n🎵 Generating text sample:");
-    let test_input = "Hello";
+    let test_input = "Love ";  // Match Python test input
     let test_encoding = tokenizer
         .encode(test_input, false)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -480,7 +497,7 @@ fn main() -> Result<()> {
         &device
     ).reshape([1, test_tokens.len()]);
     
-    let max_new_tokens = 100;
+    let max_new_tokens = 500;  // Match Python max_new_tokens
     println!("Generating {} new tokens...\n", max_new_tokens);
     
     let generated_tensor = model_trained.generate(input_tensor, max_new_tokens);
