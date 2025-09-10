@@ -1,6 +1,5 @@
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::optim::AdamWConfig;
-use burn::lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig;
 use burn::grad_clipping::GradientClippingConfig;
 use burn::tensor::backend::AutodiffBackend;
 use burn::train::metric::{LearningRateMetric, LossMetric};
@@ -452,7 +451,7 @@ fn main() -> Result<()> {
     println!("Tokenizer loaded:");
     println!("  Vocabulary size: {} (matches tiktoken gpt2)", vocab_size);
     
-    let context_length: usize = 512; // increased context length for BPE tokens
+    let context_length: usize = 48; // increased context length for BPE tokens
     
     // Create dataset using BPE tokenization
     let dataset = TextDataset::from_file("data.txt", &tokenizer, context_length)?;
@@ -493,9 +492,9 @@ fn main() -> Result<()> {
     // Match Python hyperparameters exactly
     let config = Gpt2Config {
         vocab_size,  // Use the tokenizer vocab_size (should match tiktoken)
-        d_model: 768,    // matches Python d_model
-        n_heads: 4,      // matches Python n_heads  
-        n_layers: 8,     // matches Python n_layers
+        d_model: 256,    // matches Python d_model
+        n_heads: 1,      // matches Python n_heads  
+        n_layers: 1,     // matches Python n_layers
         context_length,  // matches Python context_length (512)
     };
 
