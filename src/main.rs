@@ -8,66 +8,16 @@ use std::fs;
 use anyhow::Result;
 use burn::train::{LearnerBuilder, ClassificationOutput, TrainOutput, TrainStep, ValidStep};
 use burn::nn::{
-    Embedding, EmbeddingConfig, loss::CrossEntropyLoss,
+    Embedding, EmbeddingConfig, Linear, LinearConfig, LayerNorm, LayerNormConfig, Dropout, DropoutConfig, loss::CrossEntropyLoss,
 };
 use burn::tensor::{backend::Backend, Tensor, TensorData, Int};
 use burn::config::Config;
 use burn::module::Module;
 use std::path::PathBuf;
-use std::collections::HashMap;
+use tokenizers::Tokenizer;
 
 type WgpuBackend = burn::backend::wgpu::Wgpu;
 type WgpuAutodiffBackend = burn::backend::Autodiff<WgpuBackend>;
-
-// Character-level tokenizer similar to the Python tutorial
-#[derive(Debug, Clone)]
-pub struct CharTokenizer {
-    pub char_to_idx: HashMap<char, usize>,
-    pub idx_to_char: HashMap<usize, char>,
-    pub vocab_size: usize,
-}
-
-impl CharTokenizer {
-    pub fn from_text(text: &str) -> Self {
-        let chars: Vec<char> = text.chars().collect();
-        let unique_chars: std::collections::HashSet<char> = chars.into_iter().collect();
-        let mut chars: Vec<char> = unique_chars.into_iter().collect();
-        chars.sort();
-        
-        let char_to_idx: HashMap<char, usize> = chars
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| (c, i))
-            .collect();
-        
-        let idx_to_char: HashMap<usize, char> = chars
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| (i, c))
-            .collect();
-        
-        let vocab_size = chars.len();
-        
-        Self {
-            char_to_idx,
-            idx_to_char,
-            vocab_size,
-        }
-    }
-    
-    pub fn encode(&self, text: &str) -> Vec<i32> {
-        text.chars()
-            .map(|c| self.char_to_idx.get(&c).unwrap_or(&0).clone() as i32)
-            .collect()
-    }
-    
-    pub fn decode(&self, tokens: &[i32]) -> String {
-        tokens
-            .iter()
-            .map(|&t| self.idx_to_char.get(&(t as usize)).unwrap_or(&' '))
-            .collect()
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct TextDataset {
@@ -76,10 +26,12 @@ pub struct TextDataset {
 }
 
 impl TextDataset {
-    pub fn from_file(path: &str, tokenizer: &CharTokenizer, context_length: usize) -> Result<Self> {
+    pub fn from_file(path: &str, tokenizer: &Tokenizer, context_length: usize) -> Result<Self> {
         let content = fs::read_to_string(path)?;
-        let data = tokenizer.encode(&content);
-        
+        let encoding = tokenizer
+            .encode(content.as_str(), false)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let data = encoding.get_ids().iter().map(|&id| id as i32).collect();
         Ok(TextDataset { data, context_length })
     }
     
@@ -165,81 +117,202 @@ impl<B: Backend> Batcher<B, DatasetItem, TextBatch<B>> for TextBatcher {
     }
 }
 
+#[derive(Module, Debug)]
+pub struct PositionalEncoding<B: Backend> {
+    pe: Tensor<B, 3>, // [1, context_length, d_model]
+    context_length: usize,
+}
+
+impl<B: Backend> PositionalEncoding<B> {
+    pub fn new(context_length: usize, d_model: usize, device: &B::Device) -> Self {
+        let ln_10000 = 10000f32.ln();
+        let mut data = vec![0f32; context_length * d_model];
+        for pos in 0..context_length {
+            for i in (0..d_model).step_by(2) {
+                let div = (-(ln_10000) / d_model as f32) * (i as f32);
+                let weight = div.exp();
+                let angle = (pos as f32) * weight;
+                let base = pos * d_model + i;
+                data[base] = angle.sin();
+                if i + 1 < d_model {
+                    data[base + 1] = angle.cos();
+                }
+            }
+        }
+        let pe = Tensor::<B, 1>::from_data(TensorData::from(&data[..]), device)
+            .reshape([1, context_length, d_model]);
+        Self { pe, context_length }
+    }
+
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let dims = x.dims();
+        let seq_len = dims[1].min(self.context_length);
+        let pe_slice = self.pe.clone().slice([0..1, 0..seq_len, 0..dims[2]]);
+        x + pe_slice
+    }
+}
+
 #[derive(Config, Debug)]
 pub struct Gpt2Config {
     vocab_size: usize,
     d_model: usize,
+    context_length: usize,
 }
 
 impl Gpt2Config {
-    /// Initialize the model from config
     pub fn init<B: Backend>(&self, device: &B::Device) -> Gpt2Model<B> {
         Gpt2Model::new(self.clone(), device)
     }
 }
 
 #[derive(Module, Debug)]
+pub struct SelfAttention<B: Backend> {
+    q_proj: Linear<B>,
+    k_proj: Linear<B>,
+    v_proj: Linear<B>,
+    o_proj: Linear<B>,
+    dropout: Dropout,
+}
+
+impl<B: Backend> SelfAttention<B> {
+    pub fn new(d_model: usize, device: &B::Device) -> Self {
+        Self {
+            q_proj: LinearConfig::new(d_model, d_model).init(device),
+            k_proj: LinearConfig::new(d_model, d_model).init(device),
+            v_proj: LinearConfig::new(d_model, d_model).init(device),
+            o_proj: LinearConfig::new(d_model, d_model).init(device),
+            dropout: DropoutConfig::new(0.2).init(),
+        }
+    }
+
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [b, l, d] = x.dims();
+        let xf = x.clone().reshape([b * l, d]);
+        let q = self.q_proj.forward(xf.clone()).reshape([b, l, d]);
+        let k = self.k_proj.forward(xf.clone()).reshape([b, l, d]);
+        let v = self.v_proj.forward(xf).reshape([b, l, d]);
+        // Attention scores: [B, L, L]
+        let k_t = k.swap_dims(1, 2);
+        let mut scores = q.matmul(k_t);
+        // Scale by sqrt(d_model)
+        let scale = (d as f32).sqrt();
+        scores = scores / scale;
+        // Build causal mask (upper triangle) and add -1e9
+        let mut mask = vec![0f32; l * l];
+        for i in 0..l {
+            for j in (i + 1)..l {
+                mask[i * l + j] = 1.0;
+            }
+        }
+        let device = &scores.device();
+        // Create 1D tensor first, then reshape to [L, L] and unsqueeze to [1, L, L]
+        let mask_tensor = Tensor::<B, 1>::from_data(TensorData::from(&mask[..]), device)
+            .reshape([l, l])
+            .unsqueeze::<3>(); // [1, L, L]
+        let neg_inf = -1e9f32;
+        let mask_bias = mask_tensor * neg_inf; // [1, L, L]
+        let scores = scores + mask_bias; // broadcast over batch dim
+        // Softmax over last dimension
+        let attn = burn::tensor::activation::softmax(scores, 2);
+        let attn = self.dropout.forward(attn);
+        // Weighted sum: [B, L, D]
+        let context = attn.matmul(v);
+        // Output projection over last dim
+        let out = self.o_proj.forward(context.clone().reshape([b * l, d])).reshape([b, l, d]);
+        out
+    }
+}
+
+#[derive(Module, Debug)]
 pub struct Gpt2Model<B: Backend> {
-    wte: Embedding<B>, // word token embeddings
+    wte: Embedding<B>,
+    pos_enc: PositionalEncoding<B>,
+    att: SelfAttention<B>,
+    ln1: LayerNorm<B>,
+    ln2: LayerNorm<B>,
+    dropout: Dropout,
+    fcn1: Linear<B>,
+    fcn2: Linear<B>,
+    lm_head: Linear<B>,
     vocab_size: usize,
+    context_length: usize,
 }
 
 impl<B: Backend> Gpt2Model<B> {
-    /// Creates a new GPT-2 model with the given configuration  
     pub fn new(config: Gpt2Config, device: &B::Device) -> Self {
         Self {
             wte: EmbeddingConfig::new(config.vocab_size, config.d_model).init(device),
+            pos_enc: PositionalEncoding::new(config.context_length, config.d_model, device),
+            att: SelfAttention::new(config.d_model, device),
+            ln1: LayerNormConfig::new(config.d_model).init(device),
+            ln2: LayerNormConfig::new(config.d_model).init(device),
+            dropout: DropoutConfig::new(0.2).init(),
+            fcn1: LinearConfig::new(config.d_model, 4 * config.d_model).init(device),
+            fcn2: LinearConfig::new(4 * config.d_model, config.d_model).init(device),
+            lm_head: LinearConfig::new(config.d_model, config.vocab_size).init(device),
             vocab_size: config.vocab_size,
+            context_length: config.context_length,
         }
     }
     
     pub fn forward(&self, inputs: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        // Get embeddings: [batch_size, seq_len, d_model]
-        let logits = self.wte.forward(inputs);
+        let x = self.wte.forward(inputs);
+        let x = self.pos_enc.forward(x);
+        // Self-attention + residual + norm
+        let att_out = self.att.forward(x.clone());
+        let x = self.ln1.forward(x + att_out);
+        let x = self.dropout.forward(x.clone());
+        // Feed-forward
+        let [b, l, d] = x.dims();
+        let x2 = x.clone().reshape([b * l, d]);
+        let x2 = self.fcn1.forward(x2);
+        let x2 = burn::tensor::activation::gelu(x2);
+        let x2 = self.fcn2.forward(x2);
+        let x2 = x2.reshape([b, l, d]);
+        // Second residual + norm
+        let x = self.ln2.forward(x2 + x);
+        // Project to vocab
+        let logits = self.lm_head.forward(x.reshape([b * l, d])).reshape([b, l, self.vocab_size]);
         logits
     }
     
-    /// Generate text similar to the Python article's generate method
     pub fn generate(&self, inputs: Tensor<B, 2, Int>, max_new_tokens: usize) -> Tensor<B, 2, Int> {
-        let mut current_inputs = inputs;
-        
+        let mut current_inputs = inputs.clone();
+        let mut output = inputs;
         for _ in 0..max_new_tokens {
-            // Forward pass to get logits
-            let logits = self.forward(current_inputs.clone()); // [batch_size, seq_len, vocab_size]
-            
-            // Get logits for the last token in sequence for each batch
+            let dims_in = current_inputs.dims();
+            let seq_len = dims_in[1];
+            let inp_for_model = if seq_len > self.context_length {
+                current_inputs.clone().slice([
+                    0..dims_in[0],
+                    (seq_len - self.context_length)..seq_len,
+                ])
+            } else {
+                current_inputs.clone()
+            };
+
+            let logits = self.forward(inp_for_model);
             let dims = logits.dims();
-            let last_logits: Tensor<B, 2> = logits.slice([0..dims[0], (dims[1] - 1)..dims[1], 0..dims[2]])
-                .squeeze::<2>(1); // [batch_size, vocab_size]
-            
-            // Apply softmax to get probabilities
+            let last_logits: Tensor<B, 2> = logits
+                .slice([0..dims[0], (dims[1] - 1)..dims[1], 0..dims[2]])
+                .squeeze::<2>(1);
             let probs = burn::tensor::activation::softmax(last_logits, 1);
-            
-            // Sample from the probability distribution
-            let next_token: Tensor<B, 2, Int> = probs.argmax(1).unsqueeze::<2>(); // Simple argmax sampling for now
-            
-            // Concatenate the new token to the sequence
+            let next_token: Tensor<B, 2, Int> = probs.argmax(1).unsqueeze::<2>();
+
+            output = Tensor::cat(vec![output, next_token.clone()], 1);
             current_inputs = Tensor::cat(vec![current_inputs, next_token], 1);
         }
-        
-        current_inputs
+        output
     }
     
-    /// Shared computation for both training and validation
     pub fn compute_loss(&self, batch: &TextBatch<B>) -> (Tensor<B, 1>, Tensor<B, 2>, Tensor<B, 1, Int>) {
-        // Forward pass
-        let logits = self.forward(batch.inputs.clone()); // [batch_size, seq_len, vocab_size]
-        
-        // Reshape for loss calculation
+        let logits = self.forward(batch.inputs.clone());
         let [batch_size, seq_len, _] = logits.dims();
         let logits_flat = logits.reshape([batch_size * seq_len, self.vocab_size]);
         let targets_flat = batch.targets.clone().reshape([batch_size * seq_len]);
-        
-        // Use cross entropy loss for classification
         let device = &logits_flat.device();
         let loss_tensor = CrossEntropyLoss::new(None, device)
             .forward(logits_flat.clone(), targets_flat.clone());
-        
         (loss_tensor, logits_flat, targets_flat)
     }
 }
@@ -247,13 +320,11 @@ impl<B: Backend> Gpt2Model<B> {
 impl<B: AutodiffBackend> TrainStep<TextBatch<B>, ClassificationOutput<B>> for Gpt2Model<B> {
     fn step(&self, batch: TextBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
         let (loss_tensor, logits_flat, targets_flat) = self.compute_loss(&batch);
-        
         let output = ClassificationOutput {
             loss: loss_tensor.clone(),
             output: logits_flat,
             targets: targets_flat,
         };
-        
         let gradients = loss_tensor.backward();
         TrainOutput::new(self, gradients, output)
     }
@@ -262,7 +333,6 @@ impl<B: AutodiffBackend> TrainStep<TextBatch<B>, ClassificationOutput<B>> for Gp
 impl<B: Backend> ValidStep<TextBatch<B>, ClassificationOutput<B>> for Gpt2Model<B> {
     fn step(&self, batch: TextBatch<B>) -> ClassificationOutput<B> {
         let (loss_tensor, logits_flat, targets_flat) = self.compute_loss(&batch);
-        
         ClassificationOutput {
             loss: loss_tensor,
             output: logits_flat,
@@ -272,16 +342,16 @@ impl<B: Backend> ValidStep<TextBatch<B>, ClassificationOutput<B>> for Gpt2Model<
 }
 
 fn main() -> Result<()> {
-    // Read text data and create character tokenizer
-    let text = fs::read_to_string("data.txt")?;
-    let tokenizer = CharTokenizer::from_text(&text);
+    // Load GPT-2 BPE tokenizer from tokenizer.json (HuggingFace tokenizers)
+    let tokenizer = Tokenizer::from_file("tokenizer.json")
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    println!("Tokenizer loaded:");
+    println!("  Vocabulary size: {}", tokenizer.get_vocab_size(true));
     
-    println!("Character tokenizer created:");
-    println!("  Vocabulary size: {}", tokenizer.vocab_size);
+    let context_length: usize = 512; // increased context length for BPE tokens
     
-    let context_length: usize = 256;
-    
-    // Create dataset with character tokenization
+    // Create dataset using BPE tokenization
     let dataset = TextDataset::from_file("data.txt", &tokenizer, context_length)?;
     let (train_dataset, val_dataset) = dataset.split(0.8);
     
@@ -314,13 +384,14 @@ fn main() -> Result<()> {
 
 
     let config = Gpt2Config {
-        vocab_size: tokenizer.vocab_size,
-        d_model: tokenizer.vocab_size,
+        vocab_size: tokenizer.get_vocab_size(true),
+        d_model: 512,
+        context_length,
     };
 
     let learner = learner_builder
         .devices(vec![device.clone()])
-        .num_epochs(5000)
+        .num_epochs(10)
         .metric_train_numeric(LearningRateMetric::new())
         .metric_valid_numeric(LearningRateMetric::new())
         .metric_train_numeric(LossMetric::new())
@@ -348,22 +419,27 @@ fn main() -> Result<()> {
     // Test generation like the article
     println!("\n🎵 Generating text sample:");
     let test_input = "Hello";
-    let test_tokens = tokenizer.encode(test_input);
+    let test_encoding = tokenizer
+        .encode(test_input, false)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let test_tokens: Vec<i32> = test_encoding.get_ids().iter().map(|&id| id as i32).collect();
     println!("Input: '{}'", test_input);
     
     // Create tensor for generation - need autodiff backend for trained model
     let input_tensor = Tensor::<WgpuAutodiffBackend, 1, Int>::from_data(
         TensorData::from(&test_tokens[..]),
         &device
-    ).reshape([1, test_tokens.len()]); // batch_size=1, seq_len=input_len
+    ).reshape([1, test_tokens.len()]);
     
-    // Generate new tokens
     let max_new_tokens = 100;
     println!("Generating {} new tokens...\n", max_new_tokens);
     
     let generated_tensor = model_trained.generate(input_tensor, max_new_tokens);
     let generated_data = generated_tensor.flatten::<1>(0, 1).into_data().to_vec::<i32>().unwrap();
-    let generated_text = tokenizer.decode(&generated_data);
+    let generated_ids_u32: Vec<u32> = generated_data.iter().map(|&id| id as u32).collect();
+    let generated_text = tokenizer
+        .decode(&generated_ids_u32, true)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     
     println!("Generated text:");
     println!("{}", generated_text);
